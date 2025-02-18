@@ -1,0 +1,4 @@
+import {x, y} from "math.qt";
+
+print(x);
+print(y);

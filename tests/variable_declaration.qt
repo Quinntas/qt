@@ -3,5 +3,3 @@ float y = 3.14;
 string z = "Hello World";
 char c = 'a';
 bool b = true;
-vector<int> v = [1, 2, 3];
-map<string, int> m = {{"a", 1}, {"b", 2}};
