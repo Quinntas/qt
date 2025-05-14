@@ -48,6 +48,8 @@ class TokenType(Enum):
     RPAREN = auto()
     LBRACE = auto()
     RBRACE = auto()
+    LANGLE = auto()  # <
+    RANGLE = auto()  # >
 
 
 @dataclass()
@@ -87,7 +89,9 @@ class Lexer:
         '(': TokenType.LPAREN,
         ')': TokenType.RPAREN,
         '{': TokenType.LBRACE,
-        '}': TokenType.RBRACE
+        '}': TokenType.RBRACE,
+        '<': TokenType.LANGLE,
+        '>': TokenType.RANGLE
     }
 
     def __init__(self):
@@ -97,10 +101,11 @@ class Lexer:
             ('STRING', r'"[^"\\]*(?:\\.[^"\\]*)*"'),
             ('CHAR', r"'.'"),
             ('ID', r'[a-zA-Z_]\w*'),
-            ('PUNCT', r'[=+\-*/,;[\](){}]'),
+            ('PUNCT', r'[=+\-*/,;[\]()<>{}]'),  # Added < and >
             ('COMMENTS', r'//[^\n]*'),
             ('WHITESPACE', r'\s+')
         ]
+
         self.token_re = re.compile('|'.join(f'(?P<{name}>{pattern})' for name, pattern in token_spec))
         self.token_patterns = dict(token_spec)
 
@@ -170,7 +175,7 @@ class Parser:
             elif self.current_token.type == TokenType.EXPORT:
                 nodes.append(self.export_decl())
             elif self.current_token.type in {TokenType.INT, TokenType.FLOAT, TokenType.STRING,
-                                             TokenType.CHAR, TokenType.BOOL}:
+                                             TokenType.CHAR, TokenType.BOOL, TokenType.VECTOR}:
                 peek_token = self.peek()
                 if (peek_token and peek_token.type == TokenType.ID and
                         self.peek(2) and self.peek(2).type == TokenType.LPAREN):
@@ -203,9 +208,16 @@ class Parser:
         self.match(TokenType.SEMI)
         return ('export_decl', type_info, ident, expr)
 
-    def type_spec(self) -> TokenType:
+    def type_spec(self) -> Any:
         t = self.current_token.type
         self.advance()
+
+        if t == TokenType.VECTOR:
+            self.match(TokenType.LANGLE)
+            element_type = self.type_spec()
+            self.match(TokenType.RANGLE)
+            return ('vector', element_type)
+
         return t
 
     def stmt(self) -> Tuple:
@@ -313,7 +325,14 @@ class Parser:
             return token.value
         elif token.type == TokenType.ID:
             self.advance()
-            if self.current_token and self.current_token.type == TokenType.LPAREN:
+            # Handle indexing operations for vectors
+            if self.current_token and self.current_token.type == TokenType.LBRACKET:
+                self.match(TokenType.LBRACKET)
+                index = self.expr()
+                self.match(TokenType.RBRACKET)
+                return ('index', token.value, index)
+            # Handle function calls
+            elif self.current_token and self.current_token.type == TokenType.LPAREN:
                 self.match(TokenType.LPAREN)
                 args = []
                 if self.current_token.type != TokenType.RPAREN:
@@ -325,6 +344,17 @@ class Parser:
                 return ('call', token.value, args)
             else:
                 return token.value
+        elif token.type == TokenType.LBRACKET:
+            # Handle vector literals
+            self.match(TokenType.LBRACKET)
+            elements = []
+            if self.current_token.type != TokenType.RBRACKET:
+                elements.append(self.expr())
+                while self.current_token.type == TokenType.COMMA:
+                    self.match(TokenType.COMMA)
+                    elements.append(self.expr())
+            self.match(TokenType.RBRACKET)
+            return ('vector_lit', elements)
         elif token.type == TokenType.LPAREN:
             self.match(TokenType.LPAREN)
             node = self.expr()
@@ -398,7 +428,7 @@ class Compiler:
                     self.compile_node(stmt)
                 self.scopes.pop()
                 return None
-            elif tag in ('+', '-', '*', '/', 'call'):
+            elif tag in ('+', '-', '*', '/', 'call', 'index'):
                 return self.compile_expr(node)
             else:
                 return self.compile_expr(node)
@@ -408,24 +438,67 @@ class Compiler:
     def compile_decl(self, node: Tuple) -> Optional[ir.Value]:
         tag, type_info, ident, expr = node
         value = self.compile_expr(expr)
-        llvm_ty = self.llvm_type(type_info)
 
-        if isinstance(value, ir.Constant):
-            global_var = ir.GlobalVariable(self.module, llvm_ty, ident)
-            if tag == 'export_decl':
-                # Default linkage for exports (global definition)
-                pass
+        # Handle vector type
+        if isinstance(type_info, tuple) and type_info[0] == 'vector':
+            element_type = self.llvm_type(type_info[1])
+
+            # For vector literals, determine size from the elements
+            if isinstance(expr, tuple) and expr[0] == 'vector_lit':
+                size = len(expr[1])
+                llvm_ty = ir.ArrayType(element_type, size)
+
+                # Create a global variable for the vector
+                if isinstance(value, ir.Constant):
+                    global_var = ir.GlobalVariable(self.module, llvm_ty, ident)
+                    if tag == 'export_decl':
+                        # Default linkage for exports (global definition)
+                        pass
+                    else:
+                        global_var.linkage = 'internal'
+                    global_var.global_constant = True
+                    global_var.initializer = value
+                    self.scopes[-1][ident] = global_var
+                    if tag == 'export_decl':
+                        self.scopes[0][ident] = global_var
+                # Create a local variable for the vector
+                else:
+                    alloca = self.builder.alloca(llvm_ty, name=ident)
+
+                    # Store individual elements if not a constant
+                    for i, element in enumerate(expr[1]):
+                        element_val = self.compile_expr(element)
+                        ptr = self.builder.gep(alloca, [ir.Constant(ir.IntType(32), 0),
+                                                        ir.Constant(ir.IntType(32), i)])
+                        self.builder.store(element_val, ptr)
+
+                    self.scopes[-1][ident] = alloca
             else:
-                global_var.linkage = 'internal'
-            global_var.global_constant = True
-            global_var.initializer = value
-            self.scopes[-1][ident] = global_var
-            if tag == 'export_decl':
-                self.scopes[0][ident] = global_var
+                # Handle other cases for vector initialization
+                llvm_ty = value.type
+                alloca = self.builder.alloca(llvm_ty, name=ident)
+                self.builder.store(value, alloca)
+                self.scopes[-1][ident] = alloca
         else:
-            alloca = self.builder.alloca(llvm_ty, name=ident)
-            self.builder.store(value, alloca)
-            self.scopes[-1][ident] = alloca
+            # Handle non-vector types as before
+            llvm_ty = self.llvm_type(type_info)
+
+            if isinstance(value, ir.Constant):
+                global_var = ir.GlobalVariable(self.module, llvm_ty, ident)
+                if tag == 'export_decl':
+                    # Default linkage for exports (global definition)
+                    pass
+                else:
+                    global_var.linkage = 'internal'
+                global_var.global_constant = True
+                global_var.initializer = value
+                self.scopes[-1][ident] = global_var
+                if tag == 'export_decl':
+                    self.scopes[0][ident] = global_var
+            else:
+                alloca = self.builder.alloca(llvm_ty, name=ident)
+                self.builder.store(value, alloca)
+                self.scopes[-1][ident] = alloca
 
         return None
 
@@ -562,6 +635,59 @@ class Compiler:
                     raise NameError(f"Undefined function: {func_name}")
                 compiled_args = [self.compile_expr(arg) for arg in args_exprs]
                 return self.builder.call(llvm_function, compiled_args, name=f"{func_name}_call")
+            elif tag == 'vector_lit':
+                # Handle vector literals
+                elements = expr[1]
+                if not elements:
+                    raise ValueError("Empty vector literals are not supported")
+
+                # Compile the first element to determine the type
+                first_element = self.compile_expr(elements[0])
+                element_type = first_element.type
+
+                # Create a constant array if all elements are constants
+                if all(isinstance(self.compile_expr(e), ir.Constant) for e in elements):
+                    compiled_elements = [self.compile_expr(e) for e in elements]
+                    return ir.Constant.literal_array(compiled_elements)
+
+                # Otherwise, create an array and populate it
+                array_type = ir.ArrayType(element_type, len(elements))
+                alloca = self.builder.alloca(array_type)
+
+                for i, element in enumerate(elements):
+                    element_val = self.compile_expr(element)
+                    ptr = self.builder.gep(alloca, [ir.Constant(ir.IntType(32), 0),
+                                                    ir.Constant(ir.IntType(32), i)])
+                    self.builder.store(element_val, ptr)
+
+                return self.builder.load(alloca)
+            elif tag == 'index':
+                # Handle indexing into a vector
+                var_name, index_expr = expr[1], expr[2]
+
+                # Find the variable in scopes
+                var_ptr = None
+                for scope in reversed(self.scopes):
+                    if var_name in scope:
+                        var_ptr = scope[var_name]
+                        break
+
+                if var_ptr is None:
+                    if var_name in self.module.globals:
+                        var_ptr = self.module.globals[var_name]
+                    else:
+                        raise NameError(f"Undefined variable: {var_name}")
+
+                # Compile the index expression
+                index = self.compile_expr(index_expr)
+
+                # Get pointer to the indexed element
+                zero = ir.Constant(ir.IntType(32), 0)
+                indices = [zero, index]
+                elem_ptr = self.builder.gep(var_ptr, indices, name=f"{var_name}_elem_ptr")
+
+                # Load the element
+                return self.builder.load(elem_ptr, name=f"{var_name}_elem")
             else:
                 raise NotImplementedError(f"Unknown expression: {expr}")
         else:
@@ -578,7 +704,14 @@ class Compiler:
         self.printf_func = printf_func
         return printf_func
 
-    def llvm_type(self, type_token: TokenType) -> ir.Type:
+    def llvm_type(self, type_token: Any) -> ir.Type:
+        # Handle vector types
+        if isinstance(type_token, tuple) and type_token[0] == 'vector':
+            element_type = self.llvm_type(type_token[1])
+            # Use a placeholder size of 0 for now, actual size will be determined during compilation
+            return ir.ArrayType(element_type, 0)
+
+        # Handle regular types
         mapping = {
             TokenType.INT: ir.IntType(32),
             TokenType.FLOAT: ir.DoubleType(),

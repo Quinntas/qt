@@ -1,8 +1,0 @@
-int add(int x, int y) {
-    return x + y;
-}
-
-int x = 5;
-int y = 3;
-
-print(add(x, y));
